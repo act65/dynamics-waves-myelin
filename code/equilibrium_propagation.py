@@ -50,28 +50,30 @@ def energy_fn(x, W, b):
     """
     h = tf.nn.relu(x)
 
-    node_energy = 0.5*tf.reduce_sum(x**2, axis=1)
-    neighbor_energy = -0.5*tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
-    biased_energy = -tf.reduce_sum(h*b, axis=1)
+    energy = -0.5*tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
+    energy += -tf.reduce_sum(h*b, axis=1)
+    energy += 0.5*tf.reduce_sum(x**2, axis=1)
 
-    energy = node_energy + neighbor_energy + biased_energy
     return tf.reduce_mean(energy)
 
 def energy_fnv2(x, W, b):
-    h = tf.nn.sigmoid(x)
+    h = tf.nn.relu(x)
 
     # use the graph laplacian to measure differences between neighbors
     # how to calculate the degree!?
-    D = tf.diag(tf.abs(tf.reduce_sum(W, axis=1))**-0.5)
-    L = tf.eye(tf.shape(W)[0]) - tf.matmul(D, tf.matmul(W, D))
-    # L = D - W
+    # D = tf.diag(tf.abs(tf.reduce_sum(W, axis=1))**-0.5)
+    # L = tf.eye(tf.shape(W)[0]) - tf.matmul(D, tf.matmul(W, D))
+    L = tf.diag(tf.reduce_sum(W, axis=1)) - W
 
     neighbor_energy = 0.5*tf.reduce_sum(tf.square(tf.matmul(L, h, transpose_b=True)), axis=0)
-    acivation_energy = 0.5*tf.reduce_sum(tf.square(x), axis=1)
+    acivation_energy = 0.005*tf.reduce_sum(tf.square(x), axis=1)
+    biased_energy = -tf.reduce_sum(h*b, axis=1)
+
 
     return tf.reduce_mean(
     neighbor_energy
     + acivation_energy
+    + biased_energy
     )
 
 def get_sym_adj(n_nodes):
@@ -110,17 +112,16 @@ class Network():
     """
     def __init__(self, n_inputs, n_hidden, n_outputs, name=''):
         self.n_nodes = n_inputs + n_hidden + n_outputs
-        self.beta = 10.0
+        self.beta = 100.0
 
         self.input_idx = tf.range(n_inputs)
         self.output_idx = tf.range(n_inputs+n_hidden, self.n_nodes)
 
         with tf.variable_scope('network'):
+            # TODO sparse matrix would be nicer/faster!?
             self.weights = tf.Variable(get_sym_adj(self.n_nodes), name='weights')
             self.biases = tf.Variable(tf.random_normal(shape=[1, self.n_nodes], dtype=tf.float32), name='biases')
         self.variables = [self.weights, self.biases]
-
-        self.opt = tf.train.AdamOptimizer(0.0001)
 
     def energy_loss(self, state):
         """
@@ -135,30 +136,39 @@ class Network():
         dLdparam = mse(state, target)
         """
         with tf.name_scope('forcing_loss'):
-            return self.beta*tf.losses.mean_squared_error(tf.gather(state, idx, axis=1), vals)
+            return tf.losses.mean_squared_error(tf.gather(state, idx, axis=1), vals)
 
     def step(self, state, vals=None, idx=None):
         with tf.name_scope('step'):
             # Always trying to find a state with lower enegy
-            loss = self.energy_loss(state)
-
+            loss = 0.001*self.energy_loss(state)
             if vals is not None and idx is not None:
-                loss += self.forcing_loss(state, vals, idx)
+                loss += self.beta*self.forcing_loss(state, vals, idx)
 
             grad = tf.gradients(loss, state)[0]
-            grad = tf.clip_by_norm(grad, 1.0)
+            # grad = tf.clip_by_norm(grad, 1.0)
 
+        with tf.name_scope('gd'):
             # TODO want smarter optimisation here. AMSGrad!?
             return state - 0.1*grad
 
+    def step_v2(self, state, vals=None, idx=None):
+        with tf.name_scope('step'):
+            if vals is not None and idx is not None:
+                loss = self.beta*self.forcing_loss(state, vals, idx)
+
+            grad = tf.gradients(loss, state)[0]
+            return tf.matmul(tf.nn.relu(state) - 0.1*grad, self.weights) + self.biases
+
     def forward(self, state, vals=None, idx=None, n_steps=10):
         """
-        Use while loop to take advantage of smart compilation!?
+        Use while loop to take advantage of tf's compiler optimisations!?
         but the problem is we now have a finite window of data we can view.
         """
+        # TODO forward AD
         def step(i, state):
             # a wrapper for self.step(...)
-            return i + 1, self.step(state, vals, idx)
+            return i + 1, self.step_v2(state, vals, idx)
 
         with tf.name_scope('forward'):
             while_condition = lambda i, m : tf.less(i, n_steps)   # TODO change to state - old_state!? or low loss
@@ -172,22 +182,33 @@ def model_fn(features, labels, mode, params, config):
     net = Network(28*28, params['n_hidden'], 10)
 
     tf.summary.image('adjacency', tf.reshape(net.weights, [1, net.n_nodes, net.n_nodes, 1]))
+    tf.summary.image('bias', tf.reshape(tf.stack([net.biases for _ in range(30)]), [1, 30, net.n_nodes, 1]))
 
-    init_state = tf.random_normal([tf.shape(x)[0], net.n_nodes])
+    init_state = tf.zeros([tf.shape(x)[0], net.n_nodes])
 
     # clamp inputs
-    state_f = net.forward(init_state, x, net.input_idx, params['n_steps'])
+    state_f = net.forward(init_state, x, net.input_idx, n_steps=params['n_steps'])
+
+    im = tf.gather(state_f, net.input_idx, axis=1)
     pred = tf.gather(state_f, net.output_idx, axis=1)
-    tf.summary.histogram('preds', pred)
+    tf.summary.histogram('state_f', state_f)
+    tf.summary.image('clamped_xs', tf.reshape(im, [tf.shape(x)[0], 28, 28, 1]))
 
     # # clamp outputs
-    # state_b = net.forward(state_f, tf.one_hot(labels, 10, 1.0, 0.0, dtype=tf.float32), net.output_idx, params['n_steps'])
+    # state_b = net.forward(state_f, tf.one_hot(labels, 10, 1.0, 0.0, dtype=tf.float32), net.output_idx, n_steps=params['n_steps'])
+    # tf.summary.histogram('state_b', state_b)
+    #
     # # minimise the distance to be travelled/the changes to be made. lazy.
     # loss = tf.losses.mean_squared_error(tf.stop_gradient(state_f), state_b)
 
     loss = tf.losses.sparse_softmax_cross_entropy(logits=pred, labels=labels)
 
-    train_op = tf.train.AdamOptimizer().minimize(loss, var_list=net.variables, global_step=tf.train.get_or_create_global_step())
+    opt = tf.train.AdamOptimizer(params['learning_rate'])
+    gnvs = opt.compute_gradients(loss, var_list=net.variables)
+    for g, v in gnvs:
+        tf.summary.scalar(v.name, tf.norm(g))
+    # gnvs = [(tf.clip_by_norm(g, 1000.0), v) for g, v in gnvs]
+    train_op = opt.apply_gradients(gnvs, global_step=tf.train.get_or_create_global_step())
 
     return tf.estimator.EstimatorSpec(
       mode=mode,
@@ -206,8 +227,8 @@ def main(_):
     tf.gfile.MakeDirs(FLAGS.model_dir)
 
     mnist = tf.contrib.learn.datasets.load_dataset("mnist")
-    train_data = mnist.train.images[:200, ...]  # Returns np.array
-    train_labels = np.asarray(mnist.train.labels, dtype=np.int32)[:200, ...]
+    train_data = mnist.train.images[:5000, ...]  # Returns np.array
+    train_labels = np.asarray(mnist.train.labels, dtype=np.int32)[:5000, ...]
     # eval_data = mnist.test.images  # Returns np.array
     # eval_labels = np.asarray(mnist.test.labels, dtype=np.int32)
     eval_data = train_data
