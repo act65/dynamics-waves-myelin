@@ -48,10 +48,10 @@ def energy_fn(x, W, b):
     What alternatives are there? Want to explore these!
 
     """
-    h = tf.nn.relu(x)
+    h = tf.nn.sigmoid(x)
 
     energy = -0.5*tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
-    energy += -tf.reduce_sum(h*b, axis=1)
+    energy += 0.5*tf.reduce_sum(tf.square(h*b), axis=1)
     energy += 0.5*tf.reduce_sum(x**2, axis=1)
 
     return tf.reduce_mean(energy)
@@ -79,12 +79,13 @@ def energy_fnv2(x, W, b):
 def get_sym_adj(n_nodes):
     """
     Why does the adjacency matrix need to be symmetric?
-    Else we can prove that the back prop is equivalent?
+    Else we cant prove that the back prop is equivalent?
     """
     mat = tf.random_normal(shape=[n_nodes, n_nodes], dtype=tf.float32)
+    mat = tf.Variable(mat, name='weights')
     sym = (mat + tf.transpose(mat))/2
     adj = sym - tf.eye(n_nodes)*sym
-    return adj
+    return adj, mat
 
 class Network():
     """
@@ -112,16 +113,16 @@ class Network():
     """
     def __init__(self, n_inputs, n_hidden, n_outputs, name=''):
         self.n_nodes = n_inputs + n_hidden + n_outputs
-        self.beta = 100.0
+        self.beta = 1.0
 
         self.input_idx = tf.range(n_inputs)
         self.output_idx = tf.range(n_inputs+n_hidden, self.n_nodes)
 
         with tf.variable_scope('network'):
             # TODO sparse matrix would be nicer/faster!?
-            self.weights = tf.Variable(get_sym_adj(self.n_nodes), name='weights')
+            self.weights, self.weights_var = get_sym_adj(self.n_nodes)
             self.biases = tf.Variable(tf.random_normal(shape=[1, self.n_nodes], dtype=tf.float32), name='biases')
-        self.variables = [self.weights, self.biases]
+        self.variables = [self.weights_var, self.biases]
 
     def energy_loss(self, state):
         """
@@ -139,9 +140,22 @@ class Network():
             return tf.losses.mean_squared_error(tf.gather(state, idx, axis=1), vals)
 
     def step(self, state, vals=None, idx=None):
+        """
+        Args:
+            state (tf.tensor): the current state of the network
+                shape = [batch_size, n_nodes], dtype = tf.float32
+            vals (tf.tensor): the values to clamp certain nodes
+                shape = [batch_size, N], dtype = tf.float32
+            idx (tf.tensor): the indices of the tensors to clamp
+                shape = [1], dtype = tf.int64
+
+        Returns:
+            new_state (tf.tensor): the new state of the network
+                shape = [batch_size, n_nodes], dtype = tf.float32
+        """
         with tf.name_scope('step'):
             # Always trying to find a state with lower enegy
-            loss = 0.001*self.energy_loss(state)
+            loss = self.energy_loss(state)
             if vals is not None and idx is not None:
                 loss += self.beta*self.forcing_loss(state, vals, idx)
 
@@ -150,15 +164,8 @@ class Network():
 
         with tf.name_scope('gd'):
             # TODO want smarter optimisation here. AMSGrad!?
-            return state - 0.1*grad
-
-    def step_v2(self, state, vals=None, idx=None):
-        with tf.name_scope('step'):
-            if vals is not None and idx is not None:
-                loss = self.beta*self.forcing_loss(state, vals, idx)
-
-            grad = tf.gradients(loss, state)[0]
-            return tf.matmul(tf.nn.relu(state) - 0.1*grad, self.weights) + self.biases
+            new_state = state - 0.5*grad
+            return new_state + 0.001*tf.random_normal(tf.shape(new_state))  # add some noise into the dynamics
 
     def forward(self, state, vals=None, idx=None, n_steps=10):
         """
@@ -168,12 +175,12 @@ class Network():
         # TODO forward AD
         def step(i, state):
             # a wrapper for self.step(...)
-            return i + 1, self.step_v2(state, vals, idx)
+            return i + 1, self.step(state, vals, idx)
 
         with tf.name_scope('forward'):
             while_condition = lambda i, m : tf.less(i, n_steps)   # TODO change to state - old_state!? or low loss
             i = tf.constant(0)
-            i_, new_state = tf.while_loop(while_condition, step, loop_vars=[i, state])
+            i_, new_state = tf.while_loop(while_condition, step, loop_vars=[i, state], back_prop=False)
 
             return new_state
 
@@ -186,6 +193,8 @@ def model_fn(features, labels, mode, params, config):
 
     init_state = tf.zeros([tf.shape(x)[0], net.n_nodes])
 
+    ###########################################################################
+    ### supervised learning ###
     # clamp inputs
     state_f = net.forward(init_state, x, net.input_idx, n_steps=params['n_steps'])
 
@@ -194,27 +203,57 @@ def model_fn(features, labels, mode, params, config):
     tf.summary.histogram('state_f', state_f)
     tf.summary.image('clamped_xs', tf.reshape(im, [tf.shape(x)[0], 28, 28, 1]))
 
-    # # clamp outputs
-    # state_b = net.forward(state_f, tf.one_hot(labels, 10, 1.0, 0.0, dtype=tf.float32), net.output_idx, n_steps=params['n_steps'])
-    # tf.summary.histogram('state_b', state_b)
+    # clamp inputs and outputs
+    all_inputs = tf.concat([x, tf.one_hot(labels, 10, 1.0, 0.0, dtype=tf.float32)], axis=1)
+    all_idx = tf.concat([net.input_idx, net.output_idx], axis=0)
+    state_b = net.forward(state_f, all_inputs, all_idx, n_steps=params['n_steps'])
+    tf.summary.histogram('state_b', state_b)
+
+    loss = net.energy_loss(state_b) # - net.energy_loss(state_f)
+
+    # WANT minimise the distance to be travelled/the changes to be made. lazy. and the energy!?
+    # loss = tf.losses.mean_squared_error(state_f, state_b)  # should stop grad through f?
+
+    # just a test to see if forward pass is working.
+    # loss = tf.losses.sparse_softmax_cross_entropy(logits=pred, labels=labels)
+
+
+    ###########################################################################
+    ### unsupervised learning ###
+    # noised_input = x + 0.1*tf.random_normal(tf.shape(x))
+    # tf.summary.image('noised_input', tf.reshape(noised_input, [tf.shape(x)[0], 28, 28, 1]))
     #
-    # # minimise the distance to be travelled/the changes to be made. lazy.
-    # loss = tf.losses.mean_squared_error(tf.stop_gradient(state_f), state_b)
+    # # clamp inputs
+    # state_f = net.forward(init_state, noised_input, net.input_idx, n_steps=params['n_steps'])
+    # im = tf.gather(state_f, net.input_idx, axis=1)
+    # tf.summary.histogram('state_f', state_f)
+    # tf.summary.image('clamped_xs', tf.reshape(im, [tf.shape(x)[0], 28, 28, 1]))
+    #
+    # # run forward for a few more time steps (without clamping)
+    # state_b = net.forward(state_f, n_steps=params['n_steps'])
+    # recon = tf.gather(state_b, net.input_idx, axis=1)
+    # tf.summary.image('recon', tf.reshape(recon, [tf.shape(x)[0], 28, 28, 1]))
+    #
+    # loss = tf.losses.mean_squared_error(x, im)  # reconstruction error
 
-    loss = tf.losses.sparse_softmax_cross_entropy(logits=pred, labels=labels)
+    ###########################################################################
 
+    # training
     opt = tf.train.AdamOptimizer(params['learning_rate'])
     gnvs = opt.compute_gradients(loss, var_list=net.variables)
     for g, v in gnvs:
         tf.summary.scalar(v.name, tf.norm(g))
-    # gnvs = [(tf.clip_by_norm(g, 1000.0), v) for g, v in gnvs]
+    gnvs = [(tf.clip_by_norm(g, 100.0), v) for g, v in gnvs]
     train_op = opt.apply_gradients(gnvs, global_step=tf.train.get_or_create_global_step())
 
     return tf.estimator.EstimatorSpec(
       mode=mode,
       loss=loss,
       train_op=train_op,
-      eval_metric_ops={"accuracy": tf.metrics.accuracy(labels, tf.argmax(pred, axis=1))}
+      eval_metric_ops={
+      "accuracy": tf.metrics.accuracy(labels, tf.argmax(pred, axis=1))
+      # "mean_loss": tf.metrics.mean(loss)
+      }
     )
 
 def main(_):
