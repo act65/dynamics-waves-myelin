@@ -33,6 +33,8 @@ flags.DEFINE_integer(
     "n_steps", default=10, help="Number of forward steps to take.")
 flags.DEFINE_integer(
     "n_hidden", default=32, help="Number of hidden units.")
+flags.DEFINE_float(
+    "beta", default=1.0, help="Beta.")
 
 FLAGS = flags.FLAGS
 
@@ -46,7 +48,7 @@ def energy_fn(x, W, b):
     distance between two strongly connected nodes should be small
 
     What alternatives are there? Want to explore these!
-
+    - what if we used the graph laplacian?
     """
     with tf.name_scope('energy_fn'):
 
@@ -64,8 +66,6 @@ def forcing_fn(state, vals, idx):
     dLdparam = mse(state, target)
     """
     with tf.name_scope('forcing_fn'):
-        print('i', idx)
-        print('s',tf.gather(state, idx, axis=1))
         return tf.losses.mean_squared_error(tf.gather(state, idx, axis=1), vals)
 
 def energy_fnv2(x, W, b):
@@ -123,9 +123,9 @@ class Network():
     - must simulate for n steps rather than 1 shot prediction
     - ?
     """
-    def __init__(self, n_inputs, n_hidden, n_outputs, name=''):
+    def __init__(self, n_inputs, n_hidden, n_outputs, beta, name=''):
         self.n_nodes = n_inputs + n_hidden + n_outputs
-        self.beta = 1.0
+        self.beta = beta
 
         self.input_idx = tf.range(n_inputs)
         self.output_idx = tf.range(n_inputs+n_hidden, self.n_nodes)
@@ -152,16 +152,16 @@ class Network():
         """
         with tf.name_scope('step'):
             # Always trying to find a state with lower enegy
-            loss = energy_fn(state, self.weights, self.biases)
+            loss = 1e-3*energy_fn(state, self.weights, self.biases)
             if vals is not None and idx is not None:
-                loss += self.beta*forcing_loss(state, vals, idx)
+                loss += self.beta*forcing_fn(state, vals, idx)
 
             grad = tf.gradients(loss, state)[0]
             # grad = tf.clip_by_norm(grad, 1.0)
 
         with tf.name_scope('gd'):
             # TODO want smarter optimisation here. AMSGrad!?
-            new_state = state - 0.5*grad
+            new_state = state - 0.1*grad
             return new_state + 0.001*tf.random_normal(tf.shape(new_state))  # add some noise into the dynamics
 
     def forward(self, state, vals=None, idx=None, n_steps=10):
@@ -177,21 +177,67 @@ class Network():
         with tf.name_scope('forward'):
             while_condition = lambda i, m : tf.less(i, n_steps)   # TODO change to state - old_state!? or low loss
             i = tf.constant(0)
-            i_, new_state = tf.while_loop(while_condition, step, loop_vars=[i, state], back_prop=False)
+            i_, new_state = tf.while_loop(while_condition, step, loop_vars=[i, state], back_prop=True)
 
             return new_state
 
-def model_fn(features, labels, mode, params, config):
+
+def unsupervised_model_fn(features, labels, mode, params, config):
+    """
+    Train the network with noisy weak clamping on the state.
+    """
     x = features['x']
-    net = Network(28*28, params['n_hidden'], 10)
+    net = Network(28*28, params['n_hidden'], 10, beta=params['beta'])
 
     tf.summary.image('adjacency', tf.reshape(net.weights, [1, net.n_nodes, net.n_nodes, 1]))
     tf.summary.image('bias', tf.reshape(tf.stack([net.biases for _ in range(30)]), [1, 30, net.n_nodes, 1]))
 
     init_state = tf.zeros([tf.shape(x)[0], net.n_nodes])
 
-    ###########################################################################
-    ### supervised learning ###
+    noised_input = x + 0.1*tf.random_normal(tf.shape(x))
+    tf.summary.image('noised_input', tf.reshape(noised_input, [tf.shape(x)[0], 28, 28, 1]))
+
+    # clamp inputs
+    state_f = net.forward(init_state, noised_input, net.input_idx, n_steps=params['n_steps'])
+    im = tf.gather(state_f, net.input_idx, axis=1)
+    tf.summary.histogram('state_f', state_f)
+    tf.summary.image('clamped_xs', tf.reshape(im, [tf.shape(x)[0], 28, 28, 1]))
+
+    # run forward for a few more time steps (without clamping)
+    state_b = net.forward(state_f, n_steps=params['n_steps'])
+    recon = tf.gather(state_b, net.input_idx, axis=1)
+    tf.summary.image('recon', tf.reshape(recon, [tf.shape(x)[0], 28, 28, 1]))
+
+    # loss = tf.losses.mean_squared_error(x, im)  # reconstruction error
+    loss = energy_fn(state_b, net.weights, net.biases) - energy_fn(state_f, net.weights, net.biases)
+
+    # training
+    opt = tf.train.AdamOptimizer(params['learning_rate'])
+    gnvs = opt.compute_gradients(loss, var_list=net.variables)
+    for g, v in gnvs:
+        tf.summary.scalar(v.name, tf.norm(g))
+    gnvs = [(tf.clip_by_norm(g, 100.0), v) for g, v in gnvs]
+    train_op = opt.apply_gradients(gnvs, global_step=tf.train.get_or_create_global_step())
+
+    return tf.estimator.EstimatorSpec(
+      mode=mode,
+      loss=loss,
+      train_op=train_op,
+      eval_metric_ops={
+      "mean_loss": tf.metrics.mean(loss)
+      }
+    )
+
+
+def supervised_model_fn(features, labels, mode, params, config):
+    x = features['x']
+    net = Network(28*28, params['n_hidden'], 10, beta=params['beta'])
+
+    tf.summary.image('adjacency', tf.reshape(net.weights, [1, net.n_nodes, net.n_nodes, 1]))
+    tf.summary.image('bias', tf.reshape(tf.stack([net.biases for _ in range(30)]), [1, 30, net.n_nodes, 1]))
+
+    init_state = tf.zeros([tf.shape(x)[0], net.n_nodes])
+
     # clamp inputs
     state_f = net.forward(init_state, x, net.input_idx, n_steps=params['n_steps'])
 
@@ -201,39 +247,18 @@ def model_fn(features, labels, mode, params, config):
     tf.summary.image('clamped_xs', tf.reshape(im, [tf.shape(x)[0], 28, 28, 1]))
 
     # clamp inputs and outputs
-    all_inputs = tf.concat([x, tf.one_hot(labels, 10, 1.0, 0.0, dtype=tf.float32)], axis=1)
-    all_idx = tf.concat([net.input_idx, net.output_idx], axis=0)
-    state_b = net.forward(state_f, all_inputs, all_idx, n_steps=params['n_steps'])
-    tf.summary.histogram('state_b', state_b)
+    # all_inputs = tf.concat([x, tf.one_hot(labels, 10, 1.0, 0.0, dtype=tf.float32)], axis=1)
+    # all_idx = tf.concat([net.input_idx, net.output_idx], axis=0)
+    # state_b = net.forward(state_f, all_inputs, all_idx, n_steps=params['n_steps'])
+    # tf.summary.histogram('state_b', state_b)
 
-    loss = net.energy_loss(state_b) # - net.energy_loss(state_f)
+    # loss = energy_fn(state_b, net.weights, net.biases) # - net.energy_loss(state_f)
 
     # WANT minimise the distance to be travelled/the changes to be made. lazy. and the energy!?
     # loss = tf.losses.mean_squared_error(state_f, state_b)  # should stop grad through f?
 
     # just a test to see if forward pass is working.
-    # loss = tf.losses.sparse_softmax_cross_entropy(logits=pred, labels=labels)
-
-
-    ###########################################################################
-    ### unsupervised learning ###
-    # noised_input = x + 0.1*tf.random_normal(tf.shape(x))
-    # tf.summary.image('noised_input', tf.reshape(noised_input, [tf.shape(x)[0], 28, 28, 1]))
-    #
-    # # clamp inputs
-    # state_f = net.forward(init_state, noised_input, net.input_idx, n_steps=params['n_steps'])
-    # im = tf.gather(state_f, net.input_idx, axis=1)
-    # tf.summary.histogram('state_f', state_f)
-    # tf.summary.image('clamped_xs', tf.reshape(im, [tf.shape(x)[0], 28, 28, 1]))
-    #
-    # # run forward for a few more time steps (without clamping)
-    # state_b = net.forward(state_f, n_steps=params['n_steps'])
-    # recon = tf.gather(state_b, net.input_idx, axis=1)
-    # tf.summary.image('recon', tf.reshape(recon, [tf.shape(x)[0], 28, 28, 1]))
-    #
-    # loss = tf.losses.mean_squared_error(x, im)  # reconstruction error
-
-    ###########################################################################
+    loss = tf.losses.sparse_softmax_cross_entropy(logits=pred, labels=labels)
 
     # training
     opt = tf.train.AdamOptimizer(params['learning_rate'])
@@ -249,9 +274,9 @@ def model_fn(features, labels, mode, params, config):
       train_op=train_op,
       eval_metric_ops={
       "accuracy": tf.metrics.accuracy(labels, tf.argmax(pred, axis=1))
-      # "mean_loss": tf.metrics.mean(loss)
       }
     )
+
 
 def main(_):
     params = FLAGS.flag_values_dict()
@@ -286,7 +311,7 @@ def main(_):
 
 
     estimator = tf.estimator.Estimator(
-      model_fn,
+      supervised_model_fn,
       params=params,
       config=tf.estimator.RunConfig(
           model_dir=FLAGS.model_dir,
