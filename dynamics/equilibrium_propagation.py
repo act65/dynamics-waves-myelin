@@ -48,13 +48,25 @@ def energy_fn(x, W, b):
     What alternatives are there? Want to explore these!
 
     """
-    h = tf.nn.sigmoid(x)
+    with tf.name_scope('energy_fn'):
 
-    energy = -0.5*tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
-    energy += 0.5*tf.reduce_sum(tf.square(h*b), axis=1)
-    energy += 0.5*tf.reduce_sum(x**2, axis=1)
+        h = tf.nn.sigmoid(x)
 
-    return tf.reduce_mean(energy)
+        energy = -0.5*tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
+        energy += 0.5*tf.reduce_sum(tf.square(h*b), axis=1)
+        energy += 0.5*tf.reduce_sum(x**2, axis=1)
+
+        return tf.reduce_mean(energy)
+
+def forcing_fn(state, vals, idx):
+    """
+    How can I get grads w.r.t the parameters!?
+    dLdparam = mse(state, target)
+    """
+    with tf.name_scope('forcing_fn'):
+        print('i', idx)
+        print('s',tf.gather(state, idx, axis=1))
+        return tf.losses.mean_squared_error(tf.gather(state, idx, axis=1), vals)
 
 def energy_fnv2(x, W, b):
     h = tf.nn.relu(x)
@@ -124,21 +136,6 @@ class Network():
             self.biases = tf.Variable(tf.random_normal(shape=[1, self.n_nodes], dtype=tf.float32), name='biases')
         self.variables = [self.weights_var, self.biases]
 
-    def energy_loss(self, state):
-        """
-        WANT a single loss to optimise!!
-        """
-        with tf.name_scope('energy_loss'):
-          return tf.reduce_mean(energy_fn(state, self.weights, self.biases))
-
-    def forcing_loss(self, state, vals, idx):
-        """
-        How can I get grads w.r.t the parameters!?
-        dLdparam = mse(state, target)
-        """
-        with tf.name_scope('forcing_loss'):
-            return tf.losses.mean_squared_error(tf.gather(state, idx, axis=1), vals)
-
     def step(self, state, vals=None, idx=None):
         """
         Args:
@@ -155,9 +152,9 @@ class Network():
         """
         with tf.name_scope('step'):
             # Always trying to find a state with lower enegy
-            loss = self.energy_loss(state)
+            loss = energy_fn(state, self.weights, self.biases)
             if vals is not None and idx is not None:
-                loss += self.beta*self.forcing_loss(state, vals, idx)
+                loss += self.beta*forcing_loss(state, vals, idx)
 
             grad = tf.gradients(loss, state)[0]
             # grad = tf.clip_by_norm(grad, 1.0)
