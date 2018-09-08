@@ -54,11 +54,15 @@ def energy_fn(x, W, b):
 
         h = tf.nn.sigmoid(x)
 
-        energy = -0.5*tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
-        energy += 0.5*tf.reduce_sum(tf.square(h*b), axis=1)
-        energy += 0.5*tf.reduce_sum(x**2, axis=1)
+        neighbor_energy = -1e-4*tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
+        nonlin_energy = -1e-3*tf.reduce_sum(h*b, axis=1)
+        lin_energy = 1e0*tf.reduce_sum(x**2, axis=1)
 
-        return tf.reduce_mean(energy)
+        tf.contrib.summary.scalar('neighbor_energy', neighbor_energy)
+        tf.contrib.summary.scalar('nonlin_energy', nonlin_energy)
+        tf.contrib.summary.scalar('lin_energy', lin_energy)
+
+        return tf.reduce_mean(neighbor_energy + nonlin_energy + lin_energy)
 
 def forcing_fn(state, vals, idx):
     """

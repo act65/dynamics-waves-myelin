@@ -4,18 +4,10 @@ import numpy as np
 
 from dynamics import equilibrium_propagation as eq
 
-def loss_fn(x, W, b, vals=None, idx=None):
-    loss = 1e-4*eq.energy_fn(x, W, b)
-
-    if vals is not None and idx is not None:
-        loss += eq.forcing_fn(x, vals, idx)
-
-    return loss
-
 class Network():
     def __init__(self, n_nodes):
-        self.state_opt = tf.train.AdamOptimizer(0.01)
-        self.param_opt = tf.train.AdamOptimizer(0.0001)
+        # self.state_opt = tf.train.AdamOptimizer(0.01)
+        self.param_opt = tf.train.GradientDescentOptimizer(0.1)
 
         self.n_nodes = n_nodes
         self.beta = 10
@@ -28,30 +20,35 @@ class Network():
 
     def _init_state(self, batch_size):
         # self.state = tf.contrib.eager.Variable(tf.random_normal([batch_size, self.n_nodes]))
-        self.state = tf.zeros([batch_size, self.n_nodes])
+        self.state = 0.01*tf.random_normal([batch_size, self.n_nodes])
 
     def step(self, vals=None, idx=None, train=True):
         if self.state is None:
             self._init_state(tf.shape(vals)[0])
 
+        # update the state
         with tf.GradientTape() as tape:
-            tape.watch([self.state, self.weights, self.biases])
-            loss = loss_fn(self.state, self.weights, self.biases, vals=vals, idx=idx)
-        grads = tape.gradient(loss, [self.state, self.weights, self.biases])
+            tape.watch(self.state)
+            energy = eq.energy_fn(self.state, self.weights, self.biases)
+            forcing = eq.forcing_fn(self.state, vals=vals, idx=idx)
+            loss = energy + 20*forcing
+        grad = tape.gradient(loss, self.state)
 
-        grads = [tf.clip_by_norm(g, 1.0) if g is not None else None for g in grads ]
-        # self.state_opt.apply_gradients(zip(grads[:1], [self.state]))
+        self.state -= 200.0*tf.clip_by_norm(grad, 1.0)
+        self.state += 0.0001*tf.random_normal(tf.shape(self.state))
 
         if train:
-            self.param_opt.apply_gradients(zip(grads[1:], [self.weights, self.biases]),
-            global_step=tf.train.get_or_create_global_step())
+            # given the current state, update the params to lower its energy
+            with tf.GradientTape() as tape:
+                energy = eq.energy_fn(self.state, self.weights, self.biases) # - eq.energy_fn(self.old_state, self.weights, self.biases)
+                reg = tf.add_n([tf.reduce_mean(tf.square(var)) for var in [self.weights, self.biases]])
+                loss = energy + reg
+            e_grads = tape.gradient(loss, [self.weights, self.biases])
+            self.param_opt.apply_gradients(zip(e_grads, [self.weights, self.biases]), global_step=tf.train.get_or_create_global_step())
             # self.weights -= 1.0*grads[1]
             # self.biases -= 1.0*grads[2]
 
-        self.state -= 200.0*grads[0]
-
-
-        return self.state + 0.0001*tf.random_normal(tf.shape(self.state))
+        return self.state
 
 def main():
     batch_size = 32
@@ -101,6 +98,8 @@ def main():
             tf.contrib.summary.scalar('forcing', forcing)
 
             tf.contrib.summary.image('adjacency', tf.reshape(net.weights, [1, n_nodes, n_nodes, 1]))
+            tf.contrib.summary.histogram('weights', net.weights)
+            tf.contrib.summary.histogram('biases', net.biases)
 
             print('\r Step: {} Acc: {:.3f}'.format(i, acc), end='', flush=True)
 
