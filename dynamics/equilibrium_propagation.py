@@ -54,13 +54,13 @@ def energy_fn(x, W, b):
 
         h = tf.nn.sigmoid(x)
 
-        neighbor_energy = -1e-4*tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
-        nonlin_energy = -1e-3*tf.reduce_sum(h*b, axis=1)
-        lin_energy = 1e0*tf.reduce_sum(x**2, axis=1)
+        neighbor_energy = -tf.reduce_sum(tf.matmul(h, tf.matmul(W, h, transpose_b=True)), axis=1)
+        nonlin_energy = -tf.reduce_sum(h*b, axis=1)
+        lin_energy = tf.reduce_sum(x**2, axis=1)
 
-        tf.contrib.summary.scalar('neighbor_energy', neighbor_energy)
-        tf.contrib.summary.scalar('nonlin_energy', nonlin_energy)
-        tf.contrib.summary.scalar('lin_energy', lin_energy)
+        # tf.contrib.summary.scalar('neighbor_energy', neighbor_energy)
+        # tf.contrib.summary.scalar('nonlin_energy', nonlin_energy)
+        # tf.contrib.summary.scalar('lin_energy', lin_energy)
 
         return tf.reduce_mean(neighbor_energy + nonlin_energy + lin_energy)
 
@@ -92,16 +92,84 @@ def energy_fnv2(x, W, b):
     + biased_energy
     )
 
+
 def get_sym_adj(n_nodes):
     """
     Why does the adjacency matrix need to be symmetric?
     Else we cant prove that the back prop is equivalent?
     """
+    # BUG shouldnt have connections between outputs-outputs and inputs-inputs!
     mat = tf.random_normal(shape=[n_nodes, n_nodes], dtype=tf.float32)
     mat = tf.Variable(mat, name='weights')
     sym = (mat + tf.transpose(mat))/2
     adj = sym - tf.eye(n_nodes)*sym
     return adj, mat
+
+def get_connectome(n_inputs, n_hidden, n_outputs):
+    """
+    Inputs and outputs do not have lateral connections.
+    There is some block structure in the connectome.
+    Top and bottom diagonal blocks are zeros.
+    Inputs x inputs and outputs x outputs.
+
+    [0,   A   ]
+    [AT, W, BT]
+    [AT, B , 0]
+
+    Args:
+        n_inputs (int)
+        n_hidden (int)
+        n_outputs (int)
+
+    Returns:
+        variables (list): list of the trainable variables
+        mat (tf.tensor): the constructed adjcency matrix (or connectome)
+    """
+    # TODO Hmm, would like a nicer way of doing this.
+    # What other types of block structure would be nice?
+    # - A deep net via diagonal blocks .
+    # - Parallel computation via inverse diagonal blocks /.
+
+    n_nodes = n_inputs + n_hidden + n_outputs
+    mat = tf.Variable(tf.zeros([n_nodes, n_nodes]), trainable=False)
+
+    adj, W = get_sym_adj(n_hidden)
+    A = tf.Variable(tf.random_normal([n_inputs, n_hidden + n_outputs]))
+    B = tf.Variable(tf.random_normal([n_hidden, n_outputs]))
+    variables = [adj, A, B]
+
+    # the center
+    X, Y = tf.meshgrid(tf.range(n_inputs, n_inputs+n_hidden),
+                       tf.range(n_inputs, n_inputs+n_hidden))
+    idx = tf.reshape(tf.stack([X, Y], axis=2), [-1, 2])
+
+    mat = tf.scatter_nd_update(mat, idx, tf.reshape(W, [-1]))
+
+    # left-bottom AT
+    X, Y = tf.meshgrid(tf.range(n_inputs, n_inputs+n_hidden+n_outputs), tf.range(n_inputs))
+    idx = tf.reshape(tf.stack([X, Y], axis=2), [-1, 2])
+
+    mat = tf.scatter_nd_update(mat, idx, tf.reshape(tf.transpose(A), [-1]))
+
+    # right-top A
+    X, Y = tf.meshgrid(tf.range(n_inputs), tf.range(n_inputs, n_inputs+n_hidden+n_outputs))
+    idx = tf.reshape(tf.stack([X, Y], axis=2), [-1, 2])
+
+    mat = tf.scatter_nd_update(mat, idx, tf.reshape(A, [-1]))
+
+    # bottom B
+    X, Y = tf.meshgrid(tf.range(n_inputs+n_hidden, n_inputs+n_hidden+n_outputs), tf.range(n_inputs, n_inputs+n_hidden))
+    idx = tf.reshape(tf.stack([X, Y], axis=2), [-1, 2])
+
+    mat = tf.scatter_nd_update(mat, idx, tf.reshape(B, [-1]))
+
+    # right BT
+    X, Y = tf.meshgrid(tf.range(n_inputs, n_inputs+n_hidden), tf.range(n_inputs+n_hidden, n_inputs+n_hidden+n_outputs))
+    idx = tf.reshape(tf.stack([X, Y], axis=2), [-1, 2])
+
+    mat = tf.scatter_nd_update(mat, idx, tf.reshape(tf.transpose(B), [-1]))
+
+    return variables, mat
 
 class Network():
     """
@@ -140,7 +208,7 @@ class Network():
             self.biases = tf.Variable(tf.random_normal(shape=[1, self.n_nodes], dtype=tf.float32), name='biases')
         self.variables = [self.weights_var, self.biases]
 
-    def step(self, state, vals=None, idx=None):
+    def step(self, state, vals=None, idx=None, beta=1.0):
         """
         Args:
             state (tf.tensor): the current state of the network
@@ -154,11 +222,15 @@ class Network():
             new_state (tf.tensor): the new state of the network
                 shape = [batch_size, n_nodes], dtype = tf.float32
         """
+
         with tf.name_scope('step'):
             # Always trying to find a state with lower enegy
-            loss = 1e-3*energy_fn(state, self.weights, self.biases)
+            loss = energy_fn(state, self.weights, self.biases)
             if vals is not None and idx is not None:
-                loss += self.beta*forcing_fn(state, vals, idx)
+                if beta is None:  # clamping
+                    state = tf.scatter_update(state, idx, vals)
+                else:  # weak clamping
+                    loss += beta*forcing_fn(state, vals, idx)
 
             grad = tf.gradients(loss, state)[0]
             # grad = tf.clip_by_norm(grad, 1.0)
